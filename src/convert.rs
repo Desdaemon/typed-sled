@@ -1,7 +1,8 @@
 //! Convert one typed [Tree][crate::Tree] into another.
 //! # Example
 //! ```
-//! pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # pub fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # use typed_sled::{Tree, convert::convert};
 //!     let db = sled::Config::new().temporary(true).open().unwrap();
 //!  
 //!     {
@@ -16,8 +17,7 @@
 //!     let tree: Tree<u64, u64> = Tree::open(&db, "test_tree");
 //!     assert_eq!(tree.get(&1)?.unwrap(), 2);
 //!     assert_eq!(tree.get(&3)?.unwrap(), 4);
-//!     Ok(())
-//! }
+//! #    Ok(()) }
 //! ```
 use crate::{Tree, KV};
 use std::convert::Into;

@@ -1,4 +1,3 @@
-#![allow(clippy::type_complexity)]
 //! Support for custom (de)serialization.
 //!
 //! This module exports the same types as the root module, however the types take
@@ -43,22 +42,24 @@
 //! ```
 //!
 //! [sled]: https://docs.rs/sled/latest/sled/
-use crate::custom_serde::serialize::{Deserializer, Key, Serializer, Value};
 use core::fmt;
 use core::iter::{DoubleEndedIterator, Iterator};
-use core::ops::{Bound, RangeBounds};
+use serialize::BincodeSerDe;
+use serialize::{Deserializer, Key, Serializer, Value};
 use sled::{
     transaction::{ConflictableTransactionResult, TransactionResult},
     IVec, Result,
 };
+use std::borrow::Borrow;
 use std::marker::PhantomData;
+use std::ops::{Bound, RangeBounds};
 
 pub mod serialize;
 
-#[cfg(feature = "convert")]
+#[cfg(any(doc, feature = "convert"))]
 pub mod convert;
 
-#[cfg(feature = "key-generating")]
+#[cfg(any(doc, feature = "key-generating"))]
 pub mod key_generating;
 
 // #[cfg(feature = "search")]
@@ -100,8 +101,8 @@ pub mod key_generating;
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Tree<K, V, SerDe> {
-    inner: sled::Tree,
+pub struct Tree<K, V, SerDe = BincodeSerDe> {
+    pub(crate) inner: sled::Tree,
     _key: PhantomData<fn() -> K>,
     _value: PhantomData<fn() -> V>,
     _serde: PhantomData<fn(SerDe)>,
@@ -120,8 +121,21 @@ impl<K, V, SerDe> Clone for Tree<K, V, SerDe> {
     }
 }
 
-// // implemented like this in the sled source
-// // impl<V: std::fmt::Debug> std::error::Error for CompareAndSwapError<V> {}
+impl<K, V, SerDe> crate::transaction::TreeMeta for Tree<K, V, SerDe> {
+    type Key = K;
+    type Value = V;
+    type SerDe = SerDe;
+    type TransactionView<'view> = TransactionalTree<'view, K, V, SerDe>;
+
+    #[inline]
+    fn inner(&self) -> &sled::Tree {
+        &self.inner
+    }
+}
+
+/// A tuple of a deserialized key-value pair.
+pub type Entry<K, V, SerDe> = (Key<K, V, SerDe>, Value<K, V, SerDe>);
+pub type CompareAndSwapResult<V> = sled::Result<core::result::Result<(), CompareAndSwapError<V>>>;
 
 // These Trait bounds should probably be specified on the functions themselves, but too lazy.
 impl<K, V, SerDe> Tree<K, V, SerDe> {
@@ -166,9 +180,12 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     }
 
     /// Insert a key to a new value, returning the last value if it was set.
-    pub fn insert(&self, key: &K, value: &V) -> Result<Option<Value<K, V, SerDe>>>
+    pub fn insert<Q>(&self, key: &Q, value: &V) -> Result<Option<Value<K, V, SerDe>>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .insert(
@@ -201,9 +218,12 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     }
 
     /// Retrieve a value from the Tree if it exists.
-    pub fn get(&self, key: &K) -> Result<Option<Value<K, V, SerDe>>>
+    pub fn get<Q>(&self, key: &Q) -> Result<Option<Value<K, V, SerDe>>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .get(SerDe::SK::serialize(key))
@@ -225,7 +245,7 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     pub fn get_kv_from_raw<B: AsRef<[u8]>>(
         &self,
         key_bytes: B,
-    ) -> Result<Option<(Key<K, V, SerDe>, Value<K, V, SerDe>)>>
+    ) -> Result<Option<Entry<K, V, SerDe>>>
     where
         SerDe: serialize::SerDe<K, V>,
     {
@@ -240,9 +260,12 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     }
 
     /// Delete a value, returning the old value if it existed.
-    pub fn remove(&self, key: &K) -> Result<Option<Value<K, V, SerDe>>>
+    pub fn remove<Q>(&self, key: &Q) -> Result<Option<Value<K, V, SerDe>>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .remove(SerDe::SK::serialize(key).as_ref())
@@ -254,14 +277,17 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     /// It returns Ok(Ok(())) if operation finishes successfully.
     ///
     /// If it fails it returns: - Ok(Err(CompareAndSwapError(current, proposed))) if operation failed to setup a new value. CompareAndSwapError contains current and proposed values. - Err(Error::Unsupported) if the database is opened in read-only mode.
-    pub fn compare_and_swap(
+    pub fn compare_and_swap<Q>(
         &self,
-        key: &K,
+        key: &Q,
         old: Option<&V>,
         new: Option<&V>,
-    ) -> Result<core::result::Result<(), CompareAndSwapError<Value<K, V, SerDe>>>>
+    ) -> CompareAndSwapResult<Value<K, V, SerDe>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .compare_and_swap(
@@ -275,16 +301,19 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
             )
             .map(|cas_res| {
                 cas_res.map_err(|cas_err| CompareAndSwapError {
-                    current: cas_err.current.map(|b| SerDe::DV::deserialize(b)),
-                    proposed: cas_err.proposed.map(|b| SerDe::DV::deserialize(b)),
+                    current: cas_err.current.map(SerDe::DV::deserialize),
+                    proposed: cas_err.proposed.map(SerDe::DV::deserialize),
                 })
             })
     }
 
     /// Fetch the value, apply a function to it and return the result.
-    pub fn update_and_fetch<F>(&self, key: &K, mut f: F) -> Result<Option<Value<K, V, SerDe>>>
+    pub fn update_and_fetch<Q, F>(&self, key: &Q, mut f: F) -> Result<Option<Value<K, V, SerDe>>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
         F: FnMut(Option<Value<K, V, SerDe>>) -> Option<V>,
     {
         self.inner
@@ -302,9 +331,12 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
 
     /// Fetch the value, apply a function to it and return the previous value.
     // not sure if implemented correctly (different trait bound for F)
-    pub fn fetch_and_update<F>(&self, key: &K, mut f: F) -> Result<Option<Value<K, V, SerDe>>>
+    pub fn fetch_and_update<Q, F>(&self, key: &Q, mut f: F) -> Result<Option<Value<K, V, SerDe>>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
         F: FnMut(Option<Value<K, V, SerDe>>) -> Option<V>,
     {
         self.inner
@@ -329,9 +361,12 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     /// to block. There is a buffer of 1024 items per
     ///  `Subscriber`. This can be used to build reactive
     /// and replicated systems.
-    pub fn watch_prefix(&self, prefix: &K) -> Subscriber<K, V, SerDe>
+    pub fn watch_prefix<Q>(&self, prefix: &Q) -> Subscriber<K, V, SerDe>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         Subscriber::from_sled(self.inner.watch_prefix(SerDe::SK::serialize(prefix)))
     }
@@ -381,18 +416,24 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
 
     /// Returns `true` if the `Tree` contains a value for
     /// the specified key.
-    pub fn contains_key(&self, key: &K) -> Result<bool>
+    pub fn contains_key<Q>(&self, key: &Q) -> Result<bool>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner.contains_key(SerDe::SK::serialize(key))
     }
 
     /// Retrieve the key and value before the provided key,
     /// if one exists.
-    pub fn get_lt(&self, key: &K) -> Result<Option<(Key<K, V, SerDe>, Value<K, V, SerDe>)>>
+    pub fn get_lt<Q>(&self, key: &Q) -> Result<Option<Entry<K, V, SerDe>>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .get_lt(SerDe::SK::serialize(key))
@@ -401,9 +442,12 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
 
     /// Retrieve the next key and value from the `Tree` after the
     /// provided key.
-    pub fn get_gt(&self, key: &K) -> Result<Option<(Key<K, V, SerDe>, Value<K, V, SerDe>)>>
+    pub fn get_gt<Q>(&self, key: &Q) -> Result<Option<Entry<K, V, SerDe>>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .get_gt(SerDe::SK::serialize(key))
@@ -422,18 +466,18 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     /// Merge operators are shared by all instances of a particular
     /// `Tree`. Different merge operators may be set on different
     /// `Tree`s.
-    pub fn merge(&self, key: &K, value: &V) -> Result<Option<Value<K, V, SerDe>>>
+    pub fn merge<Q>(&self, key: &Q, value: &V) -> Result<Option<Value<K, V, SerDe>>>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .merge(SerDe::SK::serialize(key), SerDe::SV::serialize(value))
             .map(|res| res.map(|old_v| SerDe::DV::deserialize(old_v)))
     }
 
-    /// For now this maps directly to sled::Tree::set_merge_operator,
-    /// meaning you will have to handle (de)serialization yourself.
-    ///
     /// Sets a merge operator for use with the `merge` function.
     ///
     /// Merge state directly into a given key's value using the
@@ -446,8 +490,22 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     ///
     /// Calling `merge` will panic if no merge operator has been
     /// configured.
-    pub fn set_merge_operator(&self, merge_operator: impl sled::MergeOperator + 'static) {
-        self.inner.set_merge_operator(merge_operator);
+    pub fn set_merge_operator(
+        &self,
+        merge_operator: impl crate::MergeOperator<Key<K, V, SerDe>, Value<K, V, SerDe>> + 'static,
+    ) where
+        SerDe: serialize::SerDe<K, V>,
+        // i.e. requires that SV can serialize a T or Lazy<T> (via memcpy)
+        SerDe::SV: Serializer<Value<K, V, SerDe>, Bytes = Vec<u8>>,
+    {
+        self.inner.set_merge_operator(move |key, old, new| {
+            merge_operator(
+                SerDe::DK::deserialize(key.into()),
+                old.map(|v| SerDe::DV::deserialize(v.into())),
+                SerDe::DV::deserialize(new.into()),
+            )
+            .map(|v| SerDe::SV::serialize(&v))
+        });
     }
 
     /// Create a double-ended iterator over the tuples of keys and
@@ -500,16 +558,19 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
 
     /// Create an iterator over tuples of keys and values,
     /// where the all the keys starts with the given prefix.
-    pub fn scan_prefix(&self, prefix: &K) -> Iter<K, V, SerDe>
+    pub fn scan_prefix<Q>(&self, prefix: &Q) -> Iter<K, V, SerDe>
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         Iter::from_sled(self.inner.scan_prefix(SerDe::SK::serialize(prefix)))
     }
 
     /// Returns the first key and value in the `Tree`, or
     /// `None` if the `Tree` is empty.
-    pub fn first(&self) -> Result<Option<(Key<K, V, SerDe>, Value<K, V, SerDe>)>>
+    pub fn first(&self) -> Result<Option<Entry<K, V, SerDe>>>
     where
         SerDe: serialize::SerDe<K, V>,
     {
@@ -520,7 +581,7 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
 
     /// Returns the last key and value in the `Tree`, or
     /// `None` if the `Tree` is empty.
-    pub fn last(&self) -> Result<Option<(Key<K, V, SerDe>, Value<K, V, SerDe>)>>
+    pub fn last(&self) -> Result<Option<Entry<K, V, SerDe>>>
     where
         SerDe: serialize::SerDe<K, V>,
     {
@@ -529,8 +590,18 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
             .map(|res| res.map(|(k, v)| (SerDe::DK::deserialize(k), SerDe::DV::deserialize(v))))
     }
 
+    /// Returns the last key in the [`Tree`] or [`None`] if it's empty.
+    pub fn last_key(&self) -> Result<Option<Key<K, V, SerDe>>>
+    where
+        SerDe: serialize::SerDe<K, V>,
+    {
+        self.inner
+            .last()
+            .map(|res| res.map(|(k, _)| SerDe::DK::deserialize(k)))
+    }
+
     /// Atomically removes the maximum item in the `Tree` instance.
-    pub fn pop_max(&self) -> Result<Option<(Key<K, V, SerDe>, Value<K, V, SerDe>)>>
+    pub fn pop_max(&self) -> Result<Option<Entry<K, V, SerDe>>>
     where
         SerDe: serialize::SerDe<K, V>,
     {
@@ -540,7 +611,7 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     }
 
     /// Atomically removes the minimum item in the `Tree` instance.
-    pub fn pop_min(&self) -> Result<Option<(Key<K, V, SerDe>, Value<K, V, SerDe>)>>
+    pub fn pop_min(&self) -> Result<Option<Entry<K, V, SerDe>>>
     where
         SerDe: serialize::SerDe<K, V>,
     {
@@ -588,17 +659,36 @@ pub struct TransactionalTree<'a, K, V, SerDe> {
     _serde: PhantomData<fn(SerDe)>,
 }
 
+impl<'view, K, V, SerDe> View<'view> for TransactionalTree<'view, K, V, SerDe> {
+    type Tree = Tree<K, V, SerDe>;
+
+    fn view(_: &'view Self::Tree, view: &'view sled::transaction::TransactionalTree) -> Self {
+        Self::new(view)
+    }
+}
+
 impl<'a, K, V, SerDe> TransactionalTree<'a, K, V, SerDe> {
-    pub fn insert(
+    pub(crate) fn new(inner: &'a sled::transaction::TransactionalTree) -> Self {
+        Self {
+            inner,
+            _key: PhantomData,
+            _value: PhantomData,
+            _serde: PhantomData,
+        }
+    }
+    pub fn insert<Q>(
         &self,
-        key: &K,
+        key: &Q,
         value: &V,
     ) -> std::result::Result<
         Option<Value<K, V, SerDe>>,
         sled::transaction::UnabortableTransactionError,
     >
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .insert(
@@ -608,30 +698,36 @@ impl<'a, K, V, SerDe> TransactionalTree<'a, K, V, SerDe> {
             .map(|opt| opt.map(|v| SerDe::DV::deserialize(v)))
     }
 
-    pub fn remove(
+    pub fn remove<Q>(
         &self,
-        key: &K,
+        key: &Q,
     ) -> std::result::Result<
         Option<Value<K, V, SerDe>>,
         sled::transaction::UnabortableTransactionError,
     >
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .remove(SerDe::SK::serialize(key).as_ref())
             .map(|opt| opt.map(|v| SerDe::DV::deserialize(v)))
     }
 
-    pub fn get(
+    pub fn get<Q>(
         &self,
-        key: &K,
+        key: &Q,
     ) -> std::result::Result<
         Option<Value<K, V, SerDe>>,
         sled::transaction::UnabortableTransactionError,
     >
     where
+        Q: ?Sized,
+        K: Borrow<Q>,
         SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner
             .get(SerDe::SK::serialize(key))
@@ -717,16 +813,21 @@ impl<K, V, SerDe> Iter<K, V, SerDe> {
 
 #[derive(Clone, Debug)]
 pub struct Batch<K, V, SerDe> {
-    inner: sled::Batch,
+    pub(crate) inner: sled::Batch,
     _key: PhantomData<fn() -> K>,
     _value: PhantomData<fn() -> V>,
     _serde: PhantomData<fn(SerDe)>,
 }
 
-impl<K, V, SerDe> Batch<K, V, SerDe> {
-    pub fn insert(&mut self, key: &K, value: &V)
+impl<K, V, SerDe> Batch<K, V, SerDe>
+where
+    SerDe: serialize::SerDe<K, V>,
+{
+    pub fn insert<Q>(&mut self, key: &Q, value: &V)
     where
-        SerDe: serialize::SerDe<K, V>,
+        Q: ?Sized,
+        K: Borrow<Q>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner.insert(
             SerDe::SK::serialize(key).as_ref(),
@@ -734,9 +835,11 @@ impl<K, V, SerDe> Batch<K, V, SerDe> {
         );
     }
 
-    pub fn remove(&mut self, key: &K)
+    pub fn remove<Q>(&mut self, key: &Q)
     where
-        SerDe: serialize::SerDe<K, V>,
+        Q: ?Sized,
+        // K: Borrow<Q>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner.remove(SerDe::SK::serialize(key).as_ref())
     }
@@ -772,9 +875,7 @@ impl<K, V, SerDe> Subscriber<K, V, SerDe> {
     where
         SerDe: serialize::SerDe<K, V>,
     {
-        self.inner
-            .next_timeout(timeout)
-            .map(|e| Event::from_sled(e))
+        self.inner.next_timeout(timeout).map(Event::from_sled)
     }
 
     pub fn from_sled(subscriber: sled::Subscriber) -> Self {
@@ -790,6 +891,9 @@ impl<K, V, SerDe> Subscriber<K, V, SerDe> {
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+
+use crate::transaction::View;
+
 impl<K: Unpin, V: Unpin, SerDe: serialize::SerDe<K, V>> Future for Subscriber<K, V, SerDe> {
     type Output = Option<Event<K, V, SerDe>>;
 
@@ -902,5 +1006,16 @@ mod tests {
                 proposed: Some(proposed),
             }),
         );
+    }
+
+    #[test]
+    fn test_str() {
+        let config = sled::Config::new().temporary(true);
+        let db = config.open().unwrap();
+
+        let tree = Tree::<String, u32, BincodeSerDe>::open(&db, "test_tree");
+
+        tree.insert("test", &2).unwrap();
+        assert_eq!(tree.first(), Ok(Some(("test".to_string(), 2))));
     }
 }

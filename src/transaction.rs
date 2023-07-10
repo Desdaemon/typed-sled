@@ -1,67 +1,86 @@
-use std::marker::PhantomData;
+use paste::paste;
+use std::{borrow::Borrow, marker::PhantomData};
 
 use sled::transaction::{ConflictableTransactionResult, TransactionResult};
 
-use crate::{deserialize, serialize, Batch, Tree, KV};
+use crate::custom_serde::serialize::{Deserializer, Serializer, Value};
+use crate::{custom_serde::serialize, Batch};
 
-pub struct TransactionalTree<'a, K, V> {
+pub struct TransactionalTree<'a, K: ?Sized, V, SerDe> {
     inner: &'a sled::transaction::TransactionalTree,
     _key: PhantomData<fn() -> K>,
     _value: PhantomData<fn() -> V>,
+    _serde: PhantomData<SerDe>,
 }
 
-impl<'a, K, V> TransactionalTree<'a, K, V> {
-    pub(crate) fn new(sled: &'a sled::transaction::TransactionalTree) -> Self {
-        Self {
-            inner: sled,
-            _key: PhantomData,
-            _value: PhantomData,
-        }
-    }
+impl<'a, K, V, SerDe> TransactionalTree<'a, K, V, SerDe> {
+    // pub(crate) fn new(sled: &'a sled::transaction::TransactionalTree) -> Self {
+    //     Self {
+    //         inner: sled,
+    //         _key: PhantomData,
+    //         _value: PhantomData,
+    //         _serde: PhantomData,
+    //     }
+    // }
 
-    pub fn insert(
+    pub fn insert<Q>(
         &self,
-        key: &K,
+        key: &Q,
         value: &V,
-    ) -> std::result::Result<Option<V>, sled::transaction::UnabortableTransactionError>
+    ) -> std::result::Result<
+        Option<Value<K, V, SerDe>>,
+        sled::transaction::UnabortableTransactionError,
+    >
     where
-        K: KV,
-        V: KV,
+        Q: ?Sized,
+        K: Borrow<Q>,
+        SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: serialize::Serializer<Q>,
     {
         self.inner
-            .insert(serialize(key), serialize(value))
-            .map(|opt| opt.map(|v| deserialize(&v)))
+            .insert(SerDe::SK::serialize(key), SerDe::SV::serialize(value))
+            .map(|opt| opt.map(SerDe::DV::deserialize))
     }
 
-    pub fn remove(
+    pub fn remove<Q>(
         &self,
-        key: &K,
-    ) -> std::result::Result<Option<V>, sled::transaction::UnabortableTransactionError>
+        key: &Q,
+    ) -> std::result::Result<
+        Option<Value<K, V, SerDe>>,
+        sled::transaction::UnabortableTransactionError,
+    >
     where
-        K: KV,
-        V: KV,
+        Q: ?Sized,
+        K: Borrow<Q>,
+        SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: serialize::Serializer<Q>,
     {
         self.inner
-            .remove(serialize(key))
-            .map(|opt| opt.map(|v| deserialize(&v)))
+            .remove(SerDe::SK::serialize(key))
+            .map(|opt| opt.map(SerDe::DV::deserialize))
     }
 
-    pub fn get(
+    pub fn get<Q>(
         &self,
-        key: &K,
-    ) -> std::result::Result<Option<V>, sled::transaction::UnabortableTransactionError>
+        key: &Q,
+    ) -> std::result::Result<
+        Option<Value<K, V, SerDe>>,
+        sled::transaction::UnabortableTransactionError,
+    >
     where
-        K: KV,
-        V: KV,
+        Q: ?Sized,
+        K: Borrow<Q>,
+        SerDe: serialize::SerDe<K, V>,
+        SerDe::SK: serialize::Serializer<Q>,
     {
         self.inner
-            .get(serialize(key))
-            .map(|opt| opt.map(|v| deserialize(&v)))
+            .get(SerDe::SK::serialize(key))
+            .map(|opt| opt.map(SerDe::DV::deserialize))
     }
 
     pub fn apply_batch(
         &self,
-        batch: &Batch<K, V>,
+        batch: &Batch<K, V, SerDe>,
     ) -> std::result::Result<(), sled::transaction::UnabortableTransactionError> {
         self.inner.apply_batch(&batch.inner)
     }
@@ -83,66 +102,91 @@ pub trait Transactional<E = ()> {
         F: for<'a> Fn(Self::View<'a>) -> ConflictableTransactionResult<A, E>;
 }
 
-macro_rules! impl_transactional {
-  ($($k:ident, $v:ident, $i:tt),+) => {
-      impl<E, $($k, $v),+> Transactional<E> for ($(&Tree<$k, $v>),+) {
-          type View<'a> = (
-              $(TransactionalTree<'a, $k, $v>),+
-          );
+/// Implement this trait for your custom trees to benefit from auto-implementations such as [`Transactional`].
+pub trait TreeMeta {
+    type Key;
+    type Value;
+    type SerDe;
+    type TransactionView<'view>: View<'view, Tree = Self>;
 
-          fn transaction<F, A>(&self, f: F) -> TransactionResult<A, E>
-          where
-              F: for<'a> Fn(Self::View<'a>) -> ConflictableTransactionResult<A, E>,
-          {
-              use sled::Transactional;
-
-              ($(&self.$i.inner),+).transaction(|trees| {
-                  f((
-                      $(TransactionalTree::new(&trees.$i)),+
-                  ))
-              })
-          }
-      }
-  };
+    fn inner(&self) -> &sled::Tree;
 }
 
-impl_transactional!(K0, V0, 0, K1, V1, 1);
-impl_transactional!(K0, V0, 0, K1, V1, 1, K2, V2, 2);
-impl_transactional!(K0, V0, 0, K1, V1, 1, K2, V2, 2, K3, V3, 3);
-impl_transactional!(K0, V0, 0, K1, V1, 1, K2, V2, 2, K3, V3, 3, K4, V4, 4);
-impl_transactional!(K0, V0, 0, K1, V1, 1, K2, V2, 2, K3, V3, 3, K4, V4, 4, K5, V5, 5);
-impl_transactional!(K0, V0, 0, K1, V1, 1, K2, V2, 2, K3, V3, 3, K4, V4, 4, K5, V5, 5, K6, V6, 6);
-impl_transactional!(
-    K0, V0, 0, K1, V1, 1, K2, V2, 2, K3, V3, 3, K4, V4, 4, K5, V5, 5, K6, V6, 6, K7, V7, 7
-);
-impl_transactional!(
-    K0, V0, 0, K1, V1, 1, K2, V2, 2, K3, V3, 3, K4, V4, 4, K5, V5, 5, K6, V6, 6, K7, V7, 7, K8, V8,
-    8
-);
-impl_transactional!(
-    K0, V0, 0, K1, V1, 1, K2, V2, 2, K3, V3, 3, K4, V4, 4, K5, V5, 5, K6, V6, 6, K7, V7, 7, K8, V8,
-    8, K9, V9, 9
-);
-impl_transactional!(
-    K0, V0, 0, K1, V1, 1, K2, V2, 2, K3, V3, 3, K4, V4, 4, K5, V5, 5, K6, V6, 6, K7, V7, 7, K8, V8,
-    8, K9, V9, 9, K10, V10, 10
-);
+impl TreeMeta for sled::Tree {
+    type Key = &'static [u8];
+    type Value = sled::IVec;
+    type SerDe = ();
+    type TransactionView<'view> = &'view sled::transaction::TransactionalTree;
+
+    fn inner(&self) -> &sled::Tree {
+        self
+    }
+}
+
+pub trait View<'view> {
+    type Tree;
+    fn view(tree: &'view Self::Tree, view: &'view sled::transaction::TransactionalTree) -> Self;
+}
+
+impl<'view> View<'view> for &'view sled::transaction::TransactionalTree {
+    type Tree = sled::Tree;
+    fn view(_: &'view Self::Tree, view: &'view sled::transaction::TransactionalTree) -> Self {
+        view
+    }
+}
+
+macro_rules! impl_transactional {
+    ($($Type:ident),+) => {
+        impl<Err, $($Type),+> Transactional<Err> for ($(&$Type),+,)
+        where
+            $($Type: TreeMeta),+
+        {
+            type View<'view> = ( $($Type::TransactionView<'view>),+, );
+
+            #[allow(non_snake_case)]
+            fn transaction<Func, Ret>(&self, f: Func) -> TransactionResult<Ret, Err>
+            where
+                Func: for<'view> Fn(Self::View<'view>) -> ConflictableTransactionResult<Ret, Err>,
+            {
+                let ($($Type),+,) = self;
+                sled::Transactional::transaction::<_, Ret>(&( $($Type.inner()),+, ), |vars| {
+                    paste! {
+                        let ($([<$Type _var>]),+,) = vars;
+                        f(( $($Type::TransactionView::view($Type, [<$Type _var>])),+, ))
+                    }
+                })
+            }
+        }
+    };
+}
+
+impl_transactional!(A);
+impl_transactional!(A, B);
+impl_transactional!(A, B, C);
+impl_transactional!(A, B, C, D);
+impl_transactional!(A, B, C, D, E);
+impl_transactional!(A, B, C, D, E, F);
+impl_transactional!(A, B, C, D, E, F, G);
+impl_transactional!(A, B, C, D, E, F, G, H);
+impl_transactional!(A, B, C, D, E, F, G, H, I);
+impl_transactional!(A, B, C, D, E, F, G, H, I, J);
 
 #[test]
 fn test_multiple_tree_transaction() {
+    use crate::Tree;
     let db = sled::Config::new().temporary(true).open().unwrap();
     let tree0 = Tree::<u32, i32>::open(&db, "tree0");
     let tree1 = Tree::<u16, i16>::open(&db, "tree1");
-    let tree2 = Tree::<u8, i8>::open(&db, "tree2");
+    let tree2 = Tree::<String, i8>::open(&db, "tree2");
 
     (&tree0, &tree1, &tree2)
-        .transaction(|trees| {
-            trees.0.insert(&0, &0)?;
-            trees.1.insert(&0, &0)?;
-            trees.2.insert(&0, &0)?;
+        .transaction(|(tree0, tree1, tree2)| {
+            tree0.insert(&0, &0)?;
+            tree1.insert(&0, &0)?;
+            tree2.insert("asd", &0)?;
             // Todo: E in ConflitableTransactionResult<A, E> is not inferred
             // automatically, although Transactional<E = ()> has default E = () type.
-            Ok::<(), sled::transaction::ConflictableTransactionError<()>>(())
+            Ok::<_, sled::transaction::ConflictableTransactionError<()>>(())
         })
         .unwrap();
 

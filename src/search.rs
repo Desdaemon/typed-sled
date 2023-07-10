@@ -50,11 +50,12 @@
 //! ```
 //!
 //! [tantivy]: https://docs.rs/tantivy/latest/tantivy/
-use crate::{serialize, Event, Tree, KV};
+use crate::custom_serde::serialize::{self, BincodeSerDe, Key, Serializer, Value as InferValue};
+use crate::custom_serde::Entry;
+use crate::{Event, Tree};
 
 use std::fs::create_dir_all;
 use std::iter::Iterator;
-use std::thread;
 use std::{marker::PhantomData, path::Path};
 use tantivy::collector::TopDocs;
 use tantivy::DocAddress;
@@ -117,8 +118,8 @@ use tantivy::{
 /// }
 /// ```
 #[derive(Clone)]
-pub struct SearchEngine<K, V> {
-    tree: Tree<K, V>,
+pub struct SearchEngine<K, V, SerDe = BincodeSerDe> {
+    tree: Tree<K, V, SerDe>,
     pub index: Index,
     index_reader: IndexReader,
     key_field: Field,
@@ -126,33 +127,37 @@ pub struct SearchEngine<K, V> {
     phantom_value: PhantomData<fn() -> V>,
 }
 
-impl<K, V> SearchEngine<K, V> {
+impl<K, V, SerDe> SearchEngine<K, V, SerDe> {
     /// Create a new search engine or if the path already exists
     /// open an existing search engine.
     pub fn new<P: AsRef<Path> + Clone, F>(
         path: P,
-        tree: &Tree<K, V>,
+        tree: &Tree<K, V, SerDe>,
         schema_builder: SchemaBuilder,
         f: F,
     ) -> Result<Self, SearchError>
     where
-        F: Fn(&K, &V) -> Document + Send + Sync + 'static,
-        K: KV + 'static,
-        V: KV + 'static,
+        F: Fn(&Key<K, V, SerDe>, &InferValue<K, V, SerDe>) -> Document + Send + Sync + 'static,
+        SerDe: serialize::SerDe<K, V> + 'static,
+        SerDe::SK: Serializer<Key<K, V, SerDe>, Bytes = Vec<u8>>,
+        K: 'static + From<Key<K, V, SerDe>>,
+        V: 'static,
     {
         Self::new_with_options(Some(path), tree, schema_builder, f)
     }
 
     /// Create a new temporary search engine.
     pub fn new_temp<F>(
-        tree: &Tree<K, V>,
+        tree: &Tree<K, V, SerDe>,
         schema_builder: SchemaBuilder,
         f: F,
     ) -> Result<Self, SearchError>
     where
-        F: Fn(&K, &V) -> Document + Send + Sync + 'static,
-        K: KV + 'static,
-        V: KV + 'static,
+        F: Fn(&Key<K, V, SerDe>, &InferValue<K, V, SerDe>) -> Document + Send + Sync + 'static,
+        SerDe: serialize::SerDe<K, V> + 'static,
+        SerDe::SK: Serializer<Key<K, V, SerDe>, Bytes = Vec<u8>>,
+        K: 'static + From<Key<K, V, SerDe>>,
+        V: 'static,
     {
         Self::new_with_options::<&str, _>(None, tree, schema_builder, f)
     }
@@ -161,14 +166,16 @@ impl<K, V> SearchEngine<K, V> {
     /// Create a new search engine with more options.
     fn new_with_options<P: AsRef<Path> + Clone, F>(
         path: Option<P>,
-        tree: &Tree<K, V>,
+        tree: &Tree<K, V, SerDe>,
         mut schema_builder: SchemaBuilder,
         f: F,
     ) -> Result<Self, SearchError>
     where
-        F: Fn(&K, &V) -> Document + Send + Sync + 'static,
-        K: KV + 'static,
-        V: KV + 'static,
+        F: Fn(&Key<K, V, SerDe>, &InferValue<K, V, SerDe>) -> Document + Send + Sync + 'static,
+        SerDe: serialize::SerDe<K, V> + 'static,
+        SerDe::SK: Serializer<Key<K, V, SerDe>, Bytes = Vec<u8>>,
+        K: 'static + From<Key<K, V, SerDe>>,
+        V: 'static,
     {
         let key_field = schema_builder.add_bytes_field(
             "_typed_sled_key",
@@ -179,9 +186,9 @@ impl<K, V> SearchEngine<K, V> {
         );
         let schema = schema_builder.build();
 
-        let f = move |k: &K, v: &V| {
+        let f = move |k: &Key<K, V, SerDe>, v: &InferValue<K, V, SerDe>| {
             let mut document = f(k, v);
-            document.add_bytes(key_field, serialize(k));
+            document.add_bytes(key_field, SerDe::SK::serialize(k.into()));
             document
         };
 
@@ -209,7 +216,8 @@ impl<K, V> SearchEngine<K, V> {
 
         let subscriber = tree.watch_all();
         let mut index_writer = index.writer(5_000_000)?;
-        thread::spawn(move || {
+        let index_reader = index.reader()?;
+        std::thread::spawn(move || {
             for e in subscriber {
                 match e {
                     Event::Insert { key, value } => {
@@ -221,8 +229,10 @@ impl<K, V> SearchEngine<K, V> {
                             .expect("SearchEngine: failed to commit");
                     }
                     Event::Remove { key } => {
-                        index_writer
-                            .delete_term(Term::from_field_bytes(key_field, &serialize(&key)));
+                        index_writer.delete_term(Term::from_field_bytes(
+                            key_field,
+                            &SerDe::SK::serialize(&key),
+                        ));
                         index_writer
                             .commit()
                             .expect("SearchEngine: failed to commit");
@@ -231,7 +241,6 @@ impl<K, V> SearchEngine<K, V> {
             }
         });
 
-        let index_reader = index.reader()?;
         Ok(SearchEngine {
             tree: tree.to_owned(),
             index,
@@ -251,10 +260,9 @@ impl<K, V> SearchEngine<K, V> {
         &self,
         query: impl AsRef<str>,
         limit: usize,
-    ) -> Result<SearchResults<K, V>, SearchError>
+    ) -> Result<SearchResults<Key<K, V, SerDe>, InferValue<K, V, SerDe>>, SearchError>
     where
-        K: KV,
-        V: KV,
+        SerDe: serialize::SerDe<K, V>,
     {
         use tantivy::schema::Type;
         // Default types are only String like types
@@ -283,10 +291,9 @@ impl<K, V> SearchEngine<K, V> {
         &self,
         query: &dyn Query,
         limit: usize,
-    ) -> Result<SearchResults<K, V>, SearchError>
+    ) -> Result<SearchResults<Key<K, V, SerDe>, InferValue<K, V, SerDe>>, SearchError>
     where
-        K: KV,
-        V: KV,
+        SerDe: serialize::SerDe<K, V>,
     {
         let searcher = self.index_reader.searcher();
         // println!(
@@ -351,10 +358,12 @@ impl<K, V> SearchEngine<K, V> {
     /// Retrieve the key value pair corresponding to a `DocAdress`.
     /// This can for example be used after using `search_with_collector` with
     /// a custom collector which yields `DocAdress`es.
-    pub fn doc_address_to_kv(&self, doc_addr: DocAddress) -> Result<Option<(K, V)>, SearchError>
+    pub fn doc_address_to_kv(
+        &self,
+        doc_addr: DocAddress,
+    ) -> Result<Option<Entry<K, V, SerDe>>, SearchError>
     where
-        K: KV,
-        V: KV,
+        SerDe: serialize::SerDe<K, V>,
     {
         let doc = self.index_reader.searcher().doc(doc_addr)?;
 
@@ -376,10 +385,9 @@ impl<K, V> SearchEngine<K, V> {
     pub fn doc_adresses_to_kvs<I: Iterator<Item = DocAddress>>(
         &self,
         doc_addrs: I,
-    ) -> Result<Vec<Option<(K, V)>>, SearchError>
+    ) -> Result<Vec<Option<Entry<K, V, SerDe>>>, SearchError>
     where
-        K: KV,
-        V: KV,
+        SerDe: serialize::SerDe<K, V>,
     {
         let searcher = self.index_reader.searcher();
         let mut v = Vec::new();

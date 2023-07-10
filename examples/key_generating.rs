@@ -6,7 +6,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = sled::Config::new().temporary(true).open().unwrap();
 
     // The id is used by sled to identify which Tree in the database (db) to open.
-    let tree = CounterTree::open(&db, "unique_id");
+    // The value type cannot be inferred solely by the call to .open, hence the
+    // empty turbofish.
+    let tree = CounterTree::<_>::open(&db, "unique_id");
 
     let (first_key, _) = tree.insert(&5)?;
     let (second_key, _) = tree.insert(&6)?;

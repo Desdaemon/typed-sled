@@ -8,9 +8,10 @@
 //! using it together with a [Tree][crate::custom_serde::Tree] allows you
 //! to do just that.
 
+use std::convert::{TryFrom, TryInto};
+
 // use rkyv::{archived_root, ser::Serializer as _, AlignedVec, Archive, Archived};
-use serde::de::DeserializeOwned;
-use std::convert::AsRef;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 /// The default `Tree` uses bincode for (de)serialization of types
 /// that implement DeserializeOwned. However if you want to use
@@ -30,26 +31,25 @@ pub trait SerDe<K, V> {
     type DV: Deserializer<V>;
 }
 
-pub type Key<K, V, SD> = <<SD as SerDe<K, V>>::DK as Deserializer<K>>::DeserializedValue;
-pub type Value<K, V, SD> = <<SD as SerDe<K, V>>::DV as Deserializer<V>>::DeserializedValue;
+pub type Key<K, V, SD> = <<SD as SerDe<K, V>>::DK as Deserializer<K>>::Target<K>;
+pub type Value<K, V, SD> = <<SD as SerDe<K, V>>::DV as Deserializer<V>>::Target<V>;
 
-pub trait Serializer<T> {
-    type Bytes: AsRef<[u8]>;
+pub trait Serializer<T: ?Sized> {
+    type Bytes: AsRef<[u8]> + Into<sled::IVec>;
 
     fn serialize(value: &T) -> Self::Bytes;
 }
 
 pub trait Deserializer<T> {
-    type DeserializedValue;
-
-    fn deserialize(bytes: sled::IVec) -> Self::DeserializedValue;
+    type Target<T_>;
+    fn deserialize(bytes: sled::IVec) -> Self::Target<T>;
 }
 
 /// (De)serializer using bincode.
 #[derive(Debug)]
 pub struct BincodeSerDe;
-pub trait BincodeSerDeBounds: serde::Serialize + DeserializeOwned {}
-impl<T> BincodeSerDeBounds for T where T: serde::Serialize + DeserializeOwned {}
+pub trait BincodeSerDeBounds: Serialize + DeserializeOwned {}
+impl<T> BincodeSerDeBounds for T where T: Serialize + DeserializeOwned {}
 #[derive(Debug)]
 pub struct BincodeSerDeLazy;
 #[derive(Debug)]
@@ -60,10 +60,13 @@ pub struct BincodeSerDeLazyV;
 pub struct BincodeSerializer;
 #[derive(Debug)]
 pub struct BincodeDeserializer;
+#[derive(Debug)]
 pub struct BincodeDeserializerLazy;
 
-impl<K: serde::Serialize + DeserializeOwned, V: serde::Serialize + DeserializeOwned> SerDe<K, V>
-    for BincodeSerDe
+impl<K, V> SerDe<K, V> for BincodeSerDe
+where
+    K: Serialize + for<'de> Deserialize<'de>,
+    V: Serialize + for<'de> Deserialize<'de>,
 {
     type SK = BincodeSerializer;
     type SV = BincodeSerializer;
@@ -71,15 +74,21 @@ impl<K: serde::Serialize + DeserializeOwned, V: serde::Serialize + DeserializeOw
     type DV = BincodeDeserializer;
 }
 
-impl<K: serde::Serialize, V: serde::Serialize> SerDe<K, V> for BincodeSerDeLazy {
+impl<'limited, K, V> SerDe<K, V> for BincodeSerDeLazy
+where
+    K: Serialize + Deserialize<'limited>,
+    V: Serialize + Deserialize<'limited>,
+{
     type SK = BincodeSerializer;
     type SV = BincodeSerializer;
     type DK = BincodeDeserializerLazy;
     type DV = BincodeDeserializerLazy;
 }
 
-impl<K: serde::Serialize, V: serde::Serialize + DeserializeOwned> SerDe<K, V>
-    for BincodeSerDeLazyK
+impl<'limited, K, V> SerDe<K, V> for BincodeSerDeLazyK
+where
+    K: Serialize + Deserialize<'limited>,
+    V: Serialize + for<'de> Deserialize<'de>,
 {
     type SK = BincodeSerializer;
     type SV = BincodeSerializer;
@@ -87,8 +96,10 @@ impl<K: serde::Serialize, V: serde::Serialize + DeserializeOwned> SerDe<K, V>
     type DV = BincodeDeserializer;
 }
 
-impl<K: serde::Serialize + DeserializeOwned, V: serde::Serialize> SerDe<K, V>
-    for BincodeSerDeLazyV
+impl<'limited, K, V> SerDe<K, V> for BincodeSerDeLazyV
+where
+    K: Serialize + for<'de> Deserialize<'de>,
+    V: Serialize + Deserialize<'limited>,
 {
     type SK = BincodeSerializer;
     type SV = BincodeSerializer;
@@ -96,7 +107,7 @@ impl<K: serde::Serialize + DeserializeOwned, V: serde::Serialize> SerDe<K, V>
     type DV = BincodeDeserializerLazy;
 }
 
-impl<T: serde::Serialize> Serializer<T> for BincodeSerializer {
+impl<T: Serialize + ?Sized> Serializer<T> for BincodeSerializer {
     type Bytes = Vec<u8>;
 
     fn serialize(value: &T) -> Self::Bytes {
@@ -104,19 +115,25 @@ impl<T: serde::Serialize> Serializer<T> for BincodeSerializer {
     }
 }
 
-impl<T: serde::de::DeserializeOwned> Deserializer<T> for BincodeDeserializer {
-    type DeserializedValue = T;
+impl<T> Deserializer<T> for BincodeDeserializer
+where
+    T: for<'de> Deserialize<'de>,
+{
+    type Target<Inner> = Inner;
 
-    fn deserialize(bytes: sled::IVec) -> Self::DeserializedValue {
+    fn deserialize(bytes: sled::IVec) -> Self::Target<T> {
         bincode::deserialize(&bytes)
             .expect("deserialization failed, did the type serialized change?")
     }
 }
 
-impl<T> Deserializer<T> for BincodeDeserializerLazy {
-    type DeserializedValue = Lazy<T>;
+impl<'limited, T> Deserializer<T> for BincodeDeserializerLazy
+where
+    T: Deserialize<'limited>,
+{
+    type Target<Inner> = Lazy<Inner>;
 
-    fn deserialize(bytes: sled::IVec) -> Self::DeserializedValue {
+    fn deserialize(bytes: sled::IVec) -> Self::Target<T> {
         Lazy::new(bytes)
     }
 }
@@ -135,10 +152,36 @@ impl<T> Lazy<T> {
     }
 }
 
+impl<T> Serializer<Lazy<T>> for BincodeSerDeLazy {
+    type Bytes = Vec<u8>;
+
+    #[inline]
+    fn serialize(value: &Lazy<T>) -> Self::Bytes {
+        value.v.to_vec()
+    }
+}
+impl<T> Serializer<Lazy<T>> for BincodeSerDeLazyK {
+    type Bytes = Vec<u8>;
+
+    #[inline]
+    fn serialize(value: &Lazy<T>) -> Self::Bytes {
+        value.v.to_vec()
+    }
+}
+impl<T> Serializer<Lazy<T>> for BincodeSerDeLazyV {
+    type Bytes = Vec<u8>;
+
+    #[inline]
+    fn serialize(value: &Lazy<T>) -> Self::Bytes {
+        value.v.to_vec()
+    }
+}
+
 impl<T> Lazy<T> {
+    /// Deserializes the lazy value via [bincode].
     pub fn deserialize<'de>(&'de self) -> T
     where
-        T: serde::Deserialize<'de>,
+        T: Deserialize<'de>,
     {
         bincode::deserialize(&self.v)
             .expect("deserialization failed, did the type serialized change?")

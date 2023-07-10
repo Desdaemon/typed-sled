@@ -24,22 +24,50 @@
 //! ```
 use crate::custom_serde::serialize::{self, Value};
 use crate::custom_serde::{Batch, Tree};
+use crate::transaction::View;
 use sled::transaction::{ConflictableTransactionResult, TransactionResult};
 use sled::Result;
+use std::borrow::Borrow;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::serialize::Serializer;
 
 /// Wraps a type that implements KeyGenerating and uses it to
 /// generate the keys for a [Tree][crate::custom_serde::Tree].
 ///
 /// See CounterTree for a specific example of how to use this type.
 #[derive(Clone, Debug)]
-pub struct KeyGeneratingTree<KG: KeyGenerating<V, SerDe>, V, SerDe> {
+pub struct KeyGeneratingTree<KG: KeyGenerating<V>, V, SerDe> {
     key_generator: KG,
     inner: Tree<KG::Key, V, SerDe>,
 }
 
-impl<KG: KeyGenerating<V, SerDe>, V, SerDe> KeyGeneratingTree<KG, V, SerDe> {
+impl<KG, V, SerDe> crate::transaction::TreeMeta for KeyGeneratingTree<KG, V, SerDe>
+where
+    for<'a> KG: KeyGenerating<V> + 'a,
+    for<'a> KG::Key: 'a,
+    for<'a> V: 'a,
+    for<'a> SerDe: 'a,
+{
+    type Key = KG::Key;
+    type Value = V;
+    type SerDe = SerDe;
+    type TransactionView<'view> = KeyGeneratingTransactionalTree<'view, KG, V, SerDe>;
+
+    #[inline]
+    fn inner(&self) -> &sled::Tree {
+        &self.inner.inner
+    }
+}
+
+pub type KGEntry<K, V, SerDe> = (K, Option<Value<K, V, SerDe>>);
+
+impl<KG: KeyGenerating<V, SerDe = SerDe>, V, SerDe> KeyGeneratingTree<KG, V, SerDe>
+where
+    SerDe: serialize::SerDe<KG::Key, V>,
+{
     pub fn open<T: AsRef<str>>(db: &sled::Db, id: T) -> Self {
         let tree = Tree::open(db, id);
         let key_generator = KG::initialize(&tree);
@@ -51,10 +79,7 @@ impl<KG: KeyGenerating<V, SerDe>, V, SerDe> KeyGeneratingTree<KG, V, SerDe> {
     }
 
     /// Insert a generated key to a new value, returning the key and the last value if it was set.
-    pub fn insert(&self, value: &V) -> Result<(KG::Key, Option<Value<KG::Key, V, SerDe>>)>
-    where
-        SerDe: serialize::SerDe<KG::Key, V>,
-    {
+    pub fn insert(&self, value: &V) -> Result<KGEntry<KG::Key, V, SerDe>> {
         let key = self.key_generator.next_key();
         let res = self.inner.insert(&key, value);
         res.map(|opt_v| (key, opt_v))
@@ -65,13 +90,11 @@ impl<KG: KeyGenerating<V, SerDe>, V, SerDe> KeyGeneratingTree<KG, V, SerDe> {
     /// by the key generator. If you need the generated key for construction of
     /// the value, you can first use `next_key` and then use this method with
     /// the generated key. Alternatively use `insert_fn`.
-    pub fn insert_with_key(
-        &self,
-        key: &KG::Key,
-        value: &V,
-    ) -> Result<Option<Value<KG::Key, V, SerDe>>>
+    pub fn insert_with_key<Q>(&self, key: &Q, value: &V) -> Result<Option<Value<KG::Key, V, SerDe>>>
     where
-        SerDe: serialize::SerDe<KG::Key, V>,
+        Q: ?Sized,
+        KG::Key: Borrow<Q>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner.insert(key, value)
     }
@@ -83,10 +106,7 @@ impl<KG: KeyGenerating<V, SerDe>, V, SerDe> KeyGeneratingTree<KG, V, SerDe> {
     /// Insert a generated key to a new dynamically created value, returning the key and the last value if it was set.
     /// The argument supplied to `f` is a reference to the key and the returned value is the value that will
     /// be inserted at the key.
-    pub fn insert_fn(
-        &self,
-        f: impl Fn(&KG::Key) -> V,
-    ) -> Result<(KG::Key, Option<Value<KG::Key, V, SerDe>>)>
+    pub fn insert_fn(&self, f: impl Fn(&KG::Key) -> V) -> Result<KGEntry<KG::Key, V, SerDe>>
     where
         SerDe: serialize::SerDe<KG::Key, V>,
     {
@@ -103,7 +123,11 @@ impl<KG: KeyGenerating<V, SerDe>, V, SerDe> KeyGeneratingTree<KG, V, SerDe> {
         self.inner.transaction(|transactional_tree| {
             f(&KeyGeneratingTransactionalTree {
                 key_generator: self.key_generator(),
-                inner: transactional_tree,
+                inner: crate::custom_serde::TransactionalTree::view(
+                    &self.inner,
+                    &transactional_tree.inner,
+                ),
+                _marker: PhantomData,
             })
         })
     }
@@ -124,7 +148,7 @@ impl<KG: KeyGenerating<V, SerDe>, V, SerDe> KeyGeneratingTree<KG, V, SerDe> {
     }
 }
 
-impl<KG: KeyGenerating<V, SerDe>, V, SerDe> Deref for KeyGeneratingTree<KG, V, SerDe> {
+impl<KG: KeyGenerating<V>, V, SerDe> Deref for KeyGeneratingTree<KG, V, SerDe> {
     type Target = Tree<KG::Key, V, SerDe>;
 
     fn deref(&self) -> &Self::Target {
@@ -136,31 +160,34 @@ impl<KG: KeyGenerating<V, SerDe>, V, SerDe> Deref for KeyGeneratingTree<KG, V, S
 /// for a [Tree][crate::custom_serde::Tree].
 ///
 /// See CounterTree for a specific example of how to use this trait.
-pub trait KeyGenerating<V, SerDe> {
+pub trait KeyGenerating<V> {
     type Key;
+    type SerDe: serialize::SerDe<Self::Key, V>;
 
-    fn initialize(tree: &Tree<Self::Key, V, SerDe>) -> Self;
+    fn initialize(tree: &Tree<Self::Key, V, Self::SerDe>) -> Self;
 
     fn next_key(&self) -> Self::Key;
 }
 
 #[derive(Clone, Debug)]
-pub struct KeyGeneratingBatch<'a, KG: KeyGenerating<V, SerDe>, V, SerDe> {
+pub struct KeyGeneratingBatch<'a, KG: KeyGenerating<V>, V, SerDe> {
     key_generator: &'a KG,
     inner: Batch<KG::Key, V, SerDe>,
 }
 
-impl<'a, KG: KeyGenerating<V, SerDe, Key = K>, K, V, SerDe> KeyGeneratingBatch<'a, KG, V, SerDe> {
-    pub fn insert(&mut self, value: &V)
-    where
-        SerDe: serialize::SerDe<KG::Key, V>,
-    {
+impl<'a, KG: KeyGenerating<V, Key = K>, K, V, SerDe> KeyGeneratingBatch<'a, KG, V, SerDe>
+where
+    SerDe: serialize::SerDe<K, V>,
+{
+    pub fn insert(&mut self, value: &V) {
         self.inner.insert(&self.key_generator.next_key(), value);
     }
 
-    pub fn remove(&mut self, key: &K)
+    pub fn remove<Q>(&mut self, key: &Q)
     where
-        SerDe: serialize::SerDe<KG::Key, V>,
+        Q: ?Sized,
+        K: Borrow<Q>,
+        SerDe::SK: Serializer<Q>,
     {
         self.inner.remove(key)
     }
@@ -172,15 +199,16 @@ pub type CounterTree<V> = KeyGeneratingTree<Counter, V, serialize::BincodeSerDe>
 #[derive(Debug)]
 pub struct Counter(AtomicU64);
 
-impl<V> KeyGenerating<V, serialize::BincodeSerDe> for Counter
+impl<V> KeyGenerating<V> for Counter
 where
-    V: serde::Serialize + serde::de::DeserializeOwned,
+    V: crate::KV,
 {
     type Key = u64;
+    type SerDe = serialize::BincodeSerDe;
 
-    fn initialize(tree: &Tree<Self::Key, V, serialize::BincodeSerDe>) -> Self {
-        if let Some((key, _)) = tree
-            .last()
+    fn initialize(tree: &Tree<Self::Key, V, Self::SerDe>) -> Self {
+        if let Some(key) = tree
+            .last_key()
             .expect("KeyGenerating Counter failed to access sled Tree.")
         {
             Counter(AtomicU64::new(key + 1))
@@ -194,22 +222,37 @@ where
     }
 }
 
-pub struct KeyGeneratingTransactionalTree<'a, KG: KeyGenerating<V, SerDe>, V, SerDe> {
+pub struct KeyGeneratingTransactionalTree<'a, KG: KeyGenerating<V>, V, SerDe> {
     key_generator: &'a KG,
-    inner: &'a crate::custom_serde::TransactionalTree<'a, KG::Key, V, SerDe>,
+    inner: crate::custom_serde::TransactionalTree<'a, KG::Key, V, SerDe>,
+    _marker: PhantomData<(V, SerDe)>,
 }
 
-impl<'a, KG: KeyGenerating<V, SerDe>, V, SerDe> KeyGeneratingTransactionalTree<'a, KG, V, SerDe> {
+impl<'view, KG: KeyGenerating<V>, V, SerDe> View<'view>
+    for KeyGeneratingTransactionalTree<'view, KG, V, SerDe>
+{
+    type Tree = KeyGeneratingTree<KG, V, SerDe>;
+
+    fn view(tree: &'view Self::Tree, view: &'view sled::transaction::TransactionalTree) -> Self {
+        Self {
+            key_generator: &tree.key_generator,
+            inner: crate::custom_serde::TransactionalTree::new(view),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, KG: KeyGenerating<V>, V, SerDe> KeyGeneratingTransactionalTree<'a, KG, V, SerDe>
+where
+    SerDe: serialize::SerDe<KG::Key, V>,
+{
     pub fn insert(
         &self,
         value: &V,
     ) -> std::result::Result<
         Option<Value<KG::Key, V, SerDe>>,
         sled::transaction::UnabortableTransactionError,
-    >
-    where
-        SerDe: serialize::SerDe<KG::Key, V>,
-    {
+    > {
         self.inner.insert(&self.key_generator.next_key(), value)
     }
 
@@ -221,12 +264,12 @@ impl<'a, KG: KeyGenerating<V, SerDe>, V, SerDe> KeyGeneratingTransactionalTree<'
     }
 }
 
-impl<'a, KG: KeyGenerating<V, SerDe>, V, SerDe> Deref
+impl<'a, KG: KeyGenerating<V>, V, SerDe> Deref
     for KeyGeneratingTransactionalTree<'a, KG, V, SerDe>
 {
     type Target = crate::custom_serde::TransactionalTree<'a, KG::Key, V, SerDe>;
 
     fn deref(&self) -> &Self::Target {
-        self.inner
+        &self.inner
     }
 }

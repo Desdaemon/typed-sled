@@ -16,6 +16,7 @@ pin-project = "1"
 thiserror = "1"
 tantivy = {version = "0.19", optional = true}
 chrono = {version = "0.4", features = ["serde"], optional = true}
+paste = "1.0.13"
 
 [[example]]
 name = "key_generating"
@@ -30,6 +31,8 @@ name = "advanced_search"
 required-features = ["key-generating", "search", "chrono"]
 
 [features]
+default = ["full"]
+full = ["key-generating", "convert", "search"]
 key-generating = []
 convert = []
 search = ["tantivy"]
