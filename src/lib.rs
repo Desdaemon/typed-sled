@@ -50,6 +50,8 @@ pub mod transaction;
 
 pub mod custom_serde;
 
+pub mod join;
+
 use core::iter::{DoubleEndedIterator, Iterator};
 use serde::Serialize;
 use sled::Result;

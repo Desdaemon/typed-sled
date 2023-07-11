@@ -156,6 +156,7 @@ impl<K, V, SerDe> SearchEngine<K, V, SerDe> {
         F: Fn(&Key<K, V, SerDe>, &InferValue<K, V, SerDe>) -> Document + Send + Sync + 'static,
         SerDe: serialize::SerDe<K, V> + 'static,
         SerDe::SK: Serializer<Key<K, V, SerDe>, Bytes = Vec<u8>>,
+        // FIXME: This is not configurable!
         K: 'static + From<Key<K, V, SerDe>>,
         V: 'static,
     {

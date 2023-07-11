@@ -110,6 +110,7 @@ pub trait TreeMeta {
     type TransactionView<'view>: View<'view, Tree = Self>;
 
     fn inner(&self) -> &sled::Tree;
+    fn get(&self, key: &Self::Key) -> sled::Result<Option<Self::Value>>;
 }
 
 impl TreeMeta for sled::Tree {
@@ -120,6 +121,9 @@ impl TreeMeta for sled::Tree {
 
     fn inner(&self) -> &sled::Tree {
         self
+    }
+    fn get(&self, key: &Self::Key) -> sled::Result<Option<Self::Value>> {
+        self.get(key)
     }
 }
 

@@ -8,8 +8,6 @@
 //! using it together with a [Tree][crate::custom_serde::Tree] allows you
 //! to do just that.
 
-use std::convert::{TryFrom, TryInto};
-
 // use rkyv::{archived_root, ser::Serializer as _, AlignedVec, Archive, Archived};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 

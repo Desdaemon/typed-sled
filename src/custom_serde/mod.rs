@@ -121,15 +121,21 @@ impl<K, V, SerDe> Clone for Tree<K, V, SerDe> {
     }
 }
 
-impl<K, V, SerDe> crate::transaction::TreeMeta for Tree<K, V, SerDe> {
+impl<K, V, SerDe> crate::transaction::TreeMeta for Tree<K, V, SerDe>
+where
+    SerDe: serialize::SerDe<K, V>,
+{
     type Key = K;
-    type Value = V;
+    type Value = Value<K, V, SerDe>;
     type SerDe = SerDe;
     type TransactionView<'view> = TransactionalTree<'view, K, V, SerDe>;
 
     #[inline]
     fn inner(&self) -> &sled::Tree {
         &self.inner
+    }
+    fn get(&self, key: &Self::Key) -> sled::Result<Option<Self::Value>> {
+        Tree::get(self, key)
     }
 }
 
@@ -218,7 +224,7 @@ impl<K, V, SerDe> Tree<K, V, SerDe> {
     }
 
     /// Retrieve a value from the Tree if it exists.
-    pub fn get<Q>(&self, key: &Q) -> Result<Option<Value<K, V, SerDe>>>
+    pub fn get<Q>(&self, key: &Q) -> Result<Option<<Self as TreeMeta>::Value>>
     where
         Q: ?Sized,
         K: Borrow<Q>,
@@ -892,7 +898,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use crate::transaction::View;
+use crate::transaction::{TreeMeta, View};
 
 impl<K: Unpin, V: Unpin, SerDe: serialize::SerDe<K, V>> Future for Subscriber<K, V, SerDe> {
     type Output = Option<Event<K, V, SerDe>>;

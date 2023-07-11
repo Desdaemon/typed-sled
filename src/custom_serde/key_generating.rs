@@ -60,6 +60,9 @@ where
     fn inner(&self) -> &sled::Tree {
         &self.inner.inner
     }
+    fn get(&self, key: &Self::Key) -> sled::Result<Option<Self::Value>> {
+        self.get(key)
+    }
 }
 
 pub type KGEntry<K, V, SerDe> = (K, Option<Value<K, V, SerDe>>);
